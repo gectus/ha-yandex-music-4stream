@@ -1,0 +1,11 @@
+{
+  "domain": "yandex_music_4stream",
+  "name": "Yandex Music for 4STREAM",
+  "version": "0.1.0",
+  "requirements": ["yandex-music>=2.0.0"],
+  "dependencies": [],
+  "codeowners": ["@gectus"],
+  "iot_class": "local_polling",
+  "config_flow": true,
+  "documentation": "https://github.com/gectus/ha-yandex-music-4stream"
+}

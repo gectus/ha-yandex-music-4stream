@@ -1,0 +1,31 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Yandex Music",
+        "description": "Enter your Yandex Music OAuth token",
+        "data": {
+          "yandex_token": "OAuth Token"
+        }
+      },
+      "device": {
+        "title": "Add 4STREAM Device",
+        "description": "Enter the IP address of your 4STREAM/Arylic device",
+        "data": {
+          "host": "IP Address"
+        }
+      },
+      "confirm": {
+        "title": "Confirm Setup",
+        "description": "Account: {account}\nDevices: {devices}\n\nAdd another device?",
+        "data": {
+          "add_another": "Add another device"
+        }
+      }
+    },
+    "error": {
+      "auth_failed": "Failed to authenticate with Yandex Music. Check your token.",
+      "device_not_found": "Could not connect to device. Check the IP address."
+    }
+  }
+}
