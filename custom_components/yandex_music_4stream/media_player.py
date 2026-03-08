@@ -216,7 +216,15 @@ class YandexMusic4StreamPlayer(MediaPlayerEntity):
             # Get fresh direct URL (TTL ~1 min)
             direct_url = await self._ym.get_direct_url(track.track_id)
         except Exception:
-            _LOGGER.exception("Failed to get direct URL for track %s", track.track_id)
+            _LOGGER.warning("Failed to get direct URL for track %s (%s — %s), skipping",
+                            track.track_id, track.artists, track.title)
+            # Skip to next track if available
+            if len(self._queue) > 1:
+                next_idx = self._next_queue_index()
+                if next_idx is not None and next_idx != self._queue_index:
+                    self._queue_index = next_idx
+                    await self._play_track(self._queue[next_idx])
+                    return
             self._attr_state = MediaPlayerState.IDLE
             self.async_write_ha_state()
             return
