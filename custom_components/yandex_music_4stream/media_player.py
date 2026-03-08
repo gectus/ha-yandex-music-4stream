@@ -315,18 +315,53 @@ class YandexMusic4StreamPlayer(MediaPlayerEntity):
         if media_content_type is None or media_content_id is None:
             return self._build_root()
 
-        if media_content_id == "liked":
-            return await self._browse_liked()
-        elif media_content_id == "playlists":
-            return await self._browse_playlists()
-        elif media_content_id.startswith("playlist:"):
-            kind = int(media_content_id.split(":", 1)[1])
-            return await self._browse_playlist_tracks(kind)
-        elif media_content_id.startswith("search:"):
-            query = media_content_id.split(":", 1)[1]
-            return await self._browse_search(query)
-
+        handler = self._resolve_browse(media_content_id)
+        if handler:
+            return await handler()
         return self._build_root()
+
+    def _resolve_browse(self, cid: str):
+        """Route content_id to browse handler."""
+        def _parse_page(s, prefix):
+            rest = s[len(prefix):]
+            return int(rest) if rest else 0
+
+        simple = {
+            "playlists": self._browse_playlists,
+            "podcasts": self._browse_podcasts_root,
+            "books": self._browse_books_root,
+        }
+        if cid in simple:
+            return simple[cid]
+
+        # Paginated sections
+        for prefix, method in [
+            ("liked", self._browse_liked),
+            ("podcasts_top", self._browse_podcasts_top),
+            ("podcasts_my", self._browse_podcasts_my),
+            ("books_my", self._browse_books_my),
+            ("books_popular", self._browse_books_popular),
+        ]:
+            if cid == prefix or cid.startswith(f"{prefix}:"):
+                page = _parse_page(cid, f"{prefix}:")
+                return lambda p=page, m=method: m(p)
+
+        # playlist:kind or playlist:kind:page
+        if cid.startswith("playlist:"):
+            parts = cid.split(":")
+            kind = int(parts[1])
+            page = int(parts[2]) if len(parts) > 2 else 0
+            return lambda: self._browse_playlist_tracks(kind, page)
+
+        if cid.startswith("album:"):
+            album_id = cid.split(":", 1)[1]
+            return lambda: self._browse_album_episodes(album_id)
+
+        if cid.startswith("search:"):
+            query = cid.split(":", 1)[1]
+            return lambda: self._browse_search(query)
+
+        return None
 
     def _build_root(self) -> BrowseMedia:
         """Build root browse menu."""
@@ -356,25 +391,44 @@ class YandexMusic4StreamPlayer(MediaPlayerEntity):
                     can_expand=True,
                     thumbnail=None,
                 ),
+                BrowseMedia(
+                    media_class="directory",
+                    media_content_id="podcasts",
+                    media_content_type="podcast",
+                    title="Подкасты",
+                    can_play=False,
+                    can_expand=True,
+                    thumbnail=None,
+                ),
+                BrowseMedia(
+                    media_class="directory",
+                    media_content_id="books",
+                    media_content_type="music",
+                    title="Книги",
+                    can_play=False,
+                    can_expand=True,
+                    thumbnail=None,
+                ),
             ],
         )
 
-    async def _browse_liked(self) -> BrowseMedia:
-        """Browse liked tracks."""
-        tracks = await self._ym.get_liked_tracks(count=100)
+    async def _browse_liked(self, page: int = 0) -> BrowseMedia:
+        tracks, has_more = await self._ym.get_liked_tracks(page=page)
         children = [self._track_to_browse(t) for t in tracks]
+        if has_more:
+            children.append(self._more_item(f"liked:{page + 1}"))
+        title = "Мне нравится" if page == 0 else f"Мне нравится (стр. {page + 1})"
         return BrowseMedia(
             media_class="directory",
-            media_content_id="liked",
+            media_content_id=f"liked:{page}" if page else "liked",
             media_content_type="music",
-            title="Мне нравится",
+            title=title,
             can_play=True,
             can_expand=True,
             children=children,
         )
 
     async def _browse_playlists(self) -> BrowseMedia:
-        """Browse user playlists."""
         playlists = await self._ym.get_user_playlists()
         children = [
             BrowseMedia(
@@ -398,19 +452,135 @@ class YandexMusic4StreamPlayer(MediaPlayerEntity):
             children=children,
         )
 
-    async def _browse_playlist_tracks(self, kind: int) -> BrowseMedia:
-        """Browse tracks in a playlist."""
-        tracks = await self._ym.get_playlist_tracks(self._ym.user_id, kind)
+    async def _browse_playlist_tracks(self, kind: int, page: int = 0) -> BrowseMedia:
+        tracks, has_more = await self._ym.get_playlist_tracks(self._ym.user_id, kind, page=page)
         playlists = await self._ym.get_user_playlists()
-        title = next(
+        base_title = next(
             (pl["title"] for pl in playlists if pl["kind"] == kind),
             f"Плейлист {kind}",
         )
         children = [self._track_to_browse(t) for t in tracks]
+        if has_more:
+            children.append(self._more_item(f"playlist:{kind}:{page + 1}"))
+        title = base_title if page == 0 else f"{base_title} (стр. {page + 1})"
         return BrowseMedia(
             media_class="playlist",
-            media_content_id=f"playlist:{kind}",
+            media_content_id=f"playlist:{kind}:{page}" if page else f"playlist:{kind}",
             media_content_type="playlist",
+            title=title,
+            can_play=True,
+            can_expand=True,
+            children=children,
+        )
+
+    async def _browse_podcasts_root(self) -> BrowseMedia:
+        return BrowseMedia(
+            media_class="directory",
+            media_content_id="podcasts",
+            media_content_type="podcast",
+            title="Подкасты",
+            can_play=False,
+            can_expand=True,
+            children=[
+                BrowseMedia(media_class="directory", media_content_id="podcasts_my",
+                            media_content_type="podcast", title="Мои подкасты",
+                            can_play=False, can_expand=True, thumbnail=None),
+                BrowseMedia(media_class="directory", media_content_id="podcasts_top",
+                            media_content_type="podcast", title="Топ подкастов",
+                            can_play=False, can_expand=True, thumbnail=None),
+            ],
+        )
+
+    async def _browse_podcasts_top(self, page: int = 0) -> BrowseMedia:
+        podcasts, has_more = await self._ym.get_podcasts(page=page)
+        children = [self._album_to_browse(p) for p in podcasts]
+        if has_more:
+            children.append(self._more_item(f"podcasts_top:{page + 1}"))
+        title = "Топ подкастов" if page == 0 else f"Топ подкастов (стр. {page + 1})"
+        return BrowseMedia(
+            media_class="directory",
+            media_content_id=f"podcasts_top:{page}" if page else "podcasts_top",
+            media_content_type="podcast",
+            title=title,
+            can_play=False,
+            can_expand=True,
+            children=children,
+        )
+
+    async def _browse_podcasts_my(self, page: int = 0) -> BrowseMedia:
+        podcasts, has_more = await self._ym.get_my_podcasts(page=page)
+        children = [self._album_to_browse(p) for p in podcasts]
+        if has_more:
+            children.append(self._more_item(f"podcasts_my:{page + 1}"))
+        title = "Мои подкасты" if page == 0 else f"Мои подкасты (стр. {page + 1})"
+        return BrowseMedia(
+            media_class="directory",
+            media_content_id=f"podcasts_my:{page}" if page else "podcasts_my",
+            media_content_type="podcast",
+            title=title,
+            can_play=False,
+            can_expand=True,
+            children=children,
+        )
+
+    async def _browse_books_root(self) -> BrowseMedia:
+        return BrowseMedia(
+            media_class="directory",
+            media_content_id="books",
+            media_content_type="music",
+            title="Книги",
+            can_play=False,
+            can_expand=True,
+            children=[
+                BrowseMedia(media_class="directory", media_content_id="books_my",
+                            media_content_type="music", title="Мои книги",
+                            can_play=False, can_expand=True, thumbnail=None),
+                BrowseMedia(media_class="directory", media_content_id="books_popular",
+                            media_content_type="music", title="Популярные книги",
+                            can_play=False, can_expand=True, thumbnail=None),
+            ],
+        )
+
+    async def _browse_books_my(self, page: int = 0) -> BrowseMedia:
+        books, has_more = await self._ym.get_my_audiobooks(page=page)
+        children = [self._album_to_browse(b) for b in books]
+        if has_more:
+            children.append(self._more_item(f"books_my:{page + 1}"))
+        title = "Мои книги" if page == 0 else f"Мои книги (стр. {page + 1})"
+        return BrowseMedia(
+            media_class="directory",
+            media_content_id=f"books_my:{page}" if page else "books_my",
+            media_content_type="music",
+            title=title,
+            can_play=False,
+            can_expand=True,
+            children=children,
+        )
+
+    async def _browse_books_popular(self, page: int = 0) -> BrowseMedia:
+        books, has_more = await self._ym.search_audiobooks(page=page)
+        children = [self._album_to_browse(b) for b in books]
+        if has_more:
+            children.append(self._more_item(f"books_popular:{page + 1}"))
+        title = "Популярные книги" if page == 0 else f"Популярные книги (стр. {page + 1})"
+        return BrowseMedia(
+            media_class="directory",
+            media_content_id=f"books_popular:{page}" if page else "books_popular",
+            media_content_type="music",
+            title=title,
+            can_play=False,
+            can_expand=True,
+            children=children,
+        )
+
+    async def _browse_album_episodes(self, album_id: str) -> BrowseMedia:
+        """Browse episodes/chapters in a podcast or audiobook."""
+        title, tracks = await self._ym.get_album_episodes(album_id)
+        children = [self._track_to_browse(t) for t in tracks]
+        return BrowseMedia(
+            media_class="album",
+            media_content_id=f"album:{album_id}",
+            media_content_type="music",
             title=title,
             can_play=True,
             can_expand=True,
@@ -429,6 +599,31 @@ class YandexMusic4StreamPlayer(MediaPlayerEntity):
             can_play=True,
             can_expand=True,
             children=children,
+        )
+
+    @staticmethod
+    def _more_item(content_id: str) -> BrowseMedia:
+        return BrowseMedia(
+            media_class="directory",
+            media_content_id=content_id,
+            media_content_type="music",
+            title="Ещё...",
+            can_play=False,
+            can_expand=True,
+            thumbnail=None,
+        )
+
+    @staticmethod
+    def _album_to_browse(album) -> BrowseMedia:
+        """Convert AlbumInfo to BrowseMedia."""
+        return BrowseMedia(
+            media_class="album",
+            media_content_id=f"album:{album.album_id}",
+            media_content_type="music",
+            title=f"{album.title}" + (f" — {album.artists}" if album.artists else ""),
+            can_play=True,
+            can_expand=True,
+            thumbnail=album.cover_url,
         )
 
     @staticmethod
@@ -471,7 +666,7 @@ class YandexMusic4StreamPlayer(MediaPlayerEntity):
 
         # Handle media_source:// URIs for liked/playlist — load full context
         if media_id.startswith("media-source://yandex_music_4stream/liked"):
-            tracks = await self._ym.get_liked_tracks(count=100)
+            tracks = await self._ym.get_liked_tracks_all()
             if tracks:
                 self._queue = tracks
                 self._queue_index = 0
@@ -480,7 +675,16 @@ class YandexMusic4StreamPlayer(MediaPlayerEntity):
 
         if media_id.startswith("media-source://yandex_music_4stream/playlist:"):
             kind = int(media_id.split("/playlist:", 1)[1])
-            tracks = await self._ym.get_playlist_tracks(self._ym.user_id, kind)
+            tracks = await self._ym.get_playlist_tracks_all(self._ym.user_id, kind)
+            if tracks:
+                self._queue = tracks
+                self._queue_index = 0
+                await self._play_track(self._queue[0])
+            return
+
+        if media_id.startswith("media-source://yandex_music_4stream/album:"):
+            album_id = media_id.split("/album:", 1)[1]
+            _, tracks = await self._ym.get_album_episodes(album_id)
             if tracks:
                 self._queue = tracks
                 self._queue_index = 0
@@ -525,7 +729,7 @@ class YandexMusic4StreamPlayer(MediaPlayerEntity):
             return
 
         if media_id == "liked":
-            tracks = await self._ym.get_liked_tracks(count=100)
+            tracks = await self._ym.get_liked_tracks_all()
             if tracks:
                 self._queue = tracks
                 self._queue_index = 0
@@ -534,7 +738,16 @@ class YandexMusic4StreamPlayer(MediaPlayerEntity):
 
         if media_id.startswith("playlist:"):
             kind = int(media_id.split(":", 1)[1])
-            tracks = await self._ym.get_playlist_tracks(self._ym.user_id, kind)
+            tracks = await self._ym.get_playlist_tracks_all(self._ym.user_id, kind)
+            if tracks:
+                self._queue = tracks
+                self._queue_index = 0
+                await self._play_track(self._queue[0])
+            return
+
+        if media_id.startswith("album:"):
+            album_id = media_id.split(":", 1)[1]
+            _, tracks = await self._ym.get_album_episodes(album_id)
             if tracks:
                 self._queue = tracks
                 self._queue_index = 0
