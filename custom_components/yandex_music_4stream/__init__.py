@@ -21,7 +21,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Yandex Music 4STREAM from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
-    # Create shared Yandex Music client
     ym_client = YandexMusicClient(entry.data[CONF_YANDEX_TOKEN])
     try:
         await ym_client.authenticate()
@@ -33,9 +32,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         proxy = StreamProxy(port=PROXY_PORT)
         await proxy.start()
         hass.data[DOMAIN]["_proxy"] = proxy
-        hass.data[DOMAIN]["_proxy_refs"] = 0
-
-    hass.data[DOMAIN]["_proxy_refs"] += 1
 
     hass.data[DOMAIN][entry.entry_id] = {
         "ym_client": ym_client,
@@ -51,9 +47,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id)
-        hass.data[DOMAIN]["_proxy_refs"] -= 1
-        if hass.data[DOMAIN]["_proxy_refs"] <= 0:
-            await hass.data[DOMAIN]["_proxy"].stop()
-            del hass.data[DOMAIN]["_proxy"]
-            del hass.data[DOMAIN]["_proxy_refs"]
+        # Stop proxy if no config entries remain
+        has_entries = any(k for k in hass.data[DOMAIN] if not k.startswith("_"))
+        if not has_entries:
+            proxy = hass.data[DOMAIN].pop("_proxy", None)
+            if proxy:
+                await proxy.stop()
     return unload_ok

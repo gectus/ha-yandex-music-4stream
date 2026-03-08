@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
-from yandex_music import ClientAsync, Track, Album
+from yandex_music import Album, ClientAsync, Track
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -67,6 +69,13 @@ class YandexMusicClient:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
         return self._client
 
+    # --- Tracks ---
+
+    async def get_tracks_by_ids(self, track_ids: list[str]) -> list[TrackInfo]:
+        """Get tracks by IDs."""
+        tracks = await self.client.tracks(track_ids)
+        return [self._to_track_info(t) for t in tracks if t]
+
     async def search_tracks(self, query: str, count: int = 10) -> list[TrackInfo]:
         """Search for tracks by query string."""
         result = await self.client.search(query, type_="track")
@@ -83,7 +92,6 @@ class YandexMusicClient:
             track_id, get_direct_links=True
         )
 
-        # Prefer mp3 320, then mp3 any, then best available
         best = None
         for info in download_info_list:
             if info.codec == PREFERRED_CODEC and info.bitrate_in_kbps == PREFERRED_BITRATE:
@@ -107,8 +115,10 @@ class YandexMusicClient:
         )
         return url
 
+    # --- Liked tracks ---
+
     async def get_liked_tracks(self, page: int = 0) -> tuple[list[TrackInfo], bool]:
-        """Get user's liked tracks with pagination. Returns (tracks, has_more)."""
+        """Get user's liked tracks with pagination."""
         likes = await self.client.users_likes_tracks()
         if not likes:
             return ([], False)
@@ -130,6 +140,8 @@ class YandexMusicClient:
         tracks = await self.client.tracks(track_ids)
         return [self._to_track_info(t) for t in tracks]
 
+    # --- Playlists ---
+
     async def get_user_playlists(self) -> list[dict]:
         """Get list of user playlists (id, title, track_count)."""
         playlists = await self.client.users_playlists_list()
@@ -143,7 +155,7 @@ class YandexMusicClient:
         ]
 
     async def get_playlist_tracks(self, user_id: str, kind: int, page: int = 0) -> tuple[list[TrackInfo], bool]:
-        """Get tracks from a playlist with pagination. Returns (tracks, has_more)."""
+        """Get tracks from a playlist with pagination."""
         playlist = await self.client.users_playlists(kind, user_id)
         if not playlist or not playlist.tracks:
             return ([], False)
@@ -161,45 +173,130 @@ class YandexMusicClient:
         tracks = [st.track for st in playlist.tracks if st.track]
         return [self._to_track_info(t) for t in tracks]
 
+    # --- Chart ---
+
+    async def get_chart_tracks(self, page: int = 0) -> tuple[list[TrackInfo], bool]:
+        """Get chart/top tracks with pagination."""
+        chart_info = await self.client.chart()
+        if not chart_info or not chart_info.chart or not chart_info.chart.tracks:
+            return ([], False)
+        all_tracks = [st.track for st in chart_info.chart.tracks if st.track]
+        start = page * PAGE_SIZE
+        page_tracks = all_tracks[start:start + PAGE_SIZE]
+        has_more = start + PAGE_SIZE < len(all_tracks)
+        return ([self._to_track_info(t) for t in page_tracks], has_more)
+
+    async def get_chart_tracks_all(self) -> list[TrackInfo]:
+        """Get all chart tracks (for queue playback)."""
+        chart_info = await self.client.chart()
+        if not chart_info or not chart_info.chart or not chart_info.chart.tracks:
+            return []
+        tracks = [st.track for st in chart_info.chart.tracks if st.track]
+        return [self._to_track_info(t) for t in tracks]
+
+    # --- Liked albums (podcasts, audiobooks, music) ---
+
+    async def _get_liked_albums(
+        self, predicate: Callable[[Album], bool], page: int = 0
+    ) -> tuple[list[AlbumInfo], bool]:
+        """Get user's liked albums filtered by predicate, with pagination."""
+        likes = await self.client.users_likes_albums()
+        if not likes:
+            return ([], False)
+        filtered = [like.album for like in likes if like.album and predicate(like.album)]
+        start = page * PAGE_SIZE
+        page_items = filtered[start:start + PAGE_SIZE]
+        has_more = start + PAGE_SIZE < len(filtered)
+        return ([self._to_album_info(a) for a in page_items], has_more)
+
+    async def get_my_podcasts(self, page: int = 0) -> tuple[list[AlbumInfo], bool]:
+        """Get user's liked podcasts with pagination."""
+        return await self._get_liked_albums(lambda a: a.type == "podcast", page)
+
+    async def get_my_audiobooks(self, page: int = 0) -> tuple[list[AlbumInfo], bool]:
+        """Get user's liked audiobooks with pagination."""
+        return await self._get_liked_albums(lambda a: a.type == "audiobook", page)
+
+    async def get_my_albums(self, page: int = 0) -> tuple[list[AlbumInfo], bool]:
+        """Get user's liked music albums (excluding podcasts/audiobooks)."""
+        return await self._get_liked_albums(
+            lambda a: a.type not in ("podcast", "audiobook"), page
+        )
+
+    async def get_new_podcast_episodes(self, page: int = 0) -> tuple[list[TrackInfo], bool]:
+        """Get newest episodes from subscribed podcasts.
+
+        Fetches all subscribed podcasts, then gets the first episode from each
+        (ordered newest-first by the API). Results are combined and paginated.
+        """
+        likes = await self.client.users_likes_albums()
+        if not likes:
+            return ([], False)
+        podcast_ids = [
+            str(like.album.id) for like in likes
+            if like.album and like.album.type == "podcast"
+        ]
+        if not podcast_ids:
+            return ([], False)
+
+        # Fetch albums with tracks in batches to get episodes
+        BATCH_SIZE = 10
+        all_episodes: list[TrackInfo] = []
+        for i in range(0, len(podcast_ids), BATCH_SIZE):
+            batch = podcast_ids[i:i + BATCH_SIZE]
+            tasks = [self.client.albums_with_tracks(int(pid)) for pid in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    continue
+                if not result or not result.volumes:
+                    continue
+                # Take first episode (newest) from each podcast
+                episodes = result.volumes[0]
+                if episodes:
+                    all_episodes.append(self._to_track_info(episodes[0]))
+
+        # Sort by duration descending as a rough proxy (no publish date in TrackInfo)
+        # In practice episodes come in API order which is newest-first per podcast
+        start = page * PAGE_SIZE
+        page_episodes = all_episodes[start:start + PAGE_SIZE]
+        has_more = start + PAGE_SIZE < len(all_episodes)
+        return (page_episodes, has_more)
+
+    # --- Landing lists ---
+
     async def get_podcasts(self, page: int = 0) -> tuple[list[AlbumInfo], bool]:
-        """Get popular podcasts from landing with pagination. Returns (podcasts, has_more)."""
+        """Get popular podcasts from landing with pagination."""
         landing = await self.client.podcasts()
         if not landing or not landing.podcasts:
             return ([], False)
-        all_podcasts = [pid for pid in landing.podcasts]
+        all_ids = list(landing.podcasts)
         start = page * PAGE_SIZE
-        page_ids = all_podcasts[start:start + PAGE_SIZE]
+        page_ids = all_ids[start:start + PAGE_SIZE]
         if not page_ids:
             return ([], False)
         albums = await self.client.albums(page_ids)
         result = [self._to_album_info(a) for a in albums if a and a.type == "podcast"]
-        has_more = start + PAGE_SIZE < len(all_podcasts)
+        has_more = start + PAGE_SIZE < len(all_ids)
         return (result, has_more)
 
-    async def get_my_podcasts(self, page: int = 0) -> tuple[list[AlbumInfo], bool]:
-        """Get user's liked podcasts with pagination. Returns (podcasts, has_more)."""
-        likes = await self.client.users_likes_albums()
-        if not likes:
+    async def get_new_releases(self, page: int = 0) -> tuple[list[AlbumInfo], bool]:
+        """Get new music releases with pagination."""
+        landing = await self.client.new_releases()
+        if not landing or not landing.new_releases:
             return ([], False)
-        all_podcasts = [like.album for like in likes if like.album and like.album.type == "podcast"]
+        all_ids = list(landing.new_releases)
         start = page * PAGE_SIZE
-        page_items = all_podcasts[start:start + PAGE_SIZE]
-        has_more = start + PAGE_SIZE < len(all_podcasts)
-        return ([self._to_album_info(a) for a in page_items], has_more)
-
-    async def get_my_audiobooks(self, page: int = 0) -> tuple[list[AlbumInfo], bool]:
-        """Get user's liked audiobooks with pagination. Returns (books, has_more)."""
-        likes = await self.client.users_likes_albums()
-        if not likes:
+        page_ids = all_ids[start:start + PAGE_SIZE]
+        if not page_ids:
             return ([], False)
-        all_books = [like.album for like in likes if like.album and like.album.type == "audiobook"]
-        start = page * PAGE_SIZE
-        page_items = all_books[start:start + PAGE_SIZE]
-        has_more = start + PAGE_SIZE < len(all_books)
-        return ([self._to_album_info(a) for a in page_items], has_more)
+        albums = await self.client.albums(page_ids)
+        result = [self._to_album_info(a) for a in albums if a]
+        has_more = start + PAGE_SIZE < len(all_ids)
+        return (result, has_more)
 
     async def search_audiobooks(self, page: int = 0) -> tuple[list[AlbumInfo], bool]:
-        """Search for audiobooks. Returns (albums, has_more)."""
+        """Search for audiobooks."""
         result = await self.client.search("аудиокниги", type_="podcast", page=page)
         if not result or not result.podcasts:
             return ([], False)
@@ -207,11 +304,10 @@ class YandexMusicClient:
         has_more = len(result.podcasts.results) >= (result.per_page or 10)
         return (albums, has_more)
 
-    async def get_album_episodes(self, album_id: str) -> tuple[str, list[TrackInfo]]:
-        """Get tracks/episodes from an album (podcast/audiobook).
+    # --- Album/episodes ---
 
-        Returns (album_title, tracks).
-        """
+    async def get_album_tracks(self, album_id: str) -> tuple[str, list[TrackInfo]]:
+        """Get tracks from an album/podcast/audiobook. Returns (title, tracks)."""
         album = await self.client.albums_with_tracks(int(album_id))
         if not album or not album.volumes:
             return ("", [])
@@ -220,6 +316,8 @@ class YandexMusicClient:
             tracks.extend(volume)
         title = album.title or f"Album {album_id}"
         return (title, [self._to_track_info(t) for t in tracks if t])
+
+    # --- Converters ---
 
     @staticmethod
     def _to_album_info(album: Album) -> AlbumInfo:

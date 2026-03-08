@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
+import secrets
 import time
 from dataclasses import dataclass
 
@@ -46,13 +46,12 @@ class StreamProxy:
 
     def register_url(self, url: str) -> str:
         """Register an HTTPS URL and return a proxy token."""
-        # Clean expired entries
         now = time.time()
         expired = [k for k, v in self._streams.items() if now - v.created > TOKEN_TTL]
         for k in expired:
             del self._streams[k]
 
-        token = hashlib.md5(f"{url}{now}".encode()).hexdigest()
+        token = secrets.token_hex(16)
         self._streams[token] = StreamEntry(url=url, created=now)
         return token
 
@@ -63,7 +62,6 @@ class StreamProxy:
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
         """Handle stream request from 4STREAM device."""
         token = request.match_info["token"]
-        # Strip .mp3 extension if present
         if token.endswith(".mp3"):
             token = token[:-4]
 
@@ -74,7 +72,6 @@ class StreamProxy:
 
         _LOGGER.debug("Proxying stream for token %s", token)
 
-        # Forward Range header from device for seek support
         headers: dict[str, str] = {}
         if "Range" in request.headers:
             headers["Range"] = request.headers["Range"]

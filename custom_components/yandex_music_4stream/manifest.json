@@ -1,9 +1,9 @@
 {
   "domain": "yandex_music_4stream",
   "name": "Yandex Music for 4STREAM",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "requirements": ["yandex-music>=2.0.0"],
-  "dependencies": [],
+  "dependencies": ["media_source"],
   "codeowners": ["@gectus"],
   "iot_class": "local_polling",
   "config_flow": true,
